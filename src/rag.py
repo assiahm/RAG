@@ -17,7 +17,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 # Charger les données et préparer les embeddings
 @st.cache_resource
-def load_and_prepare_data(file_path, model_name="all-MiniLM-L6-v2"):
+def load_and_prepare_data(file_path, model_name="all-MiniLM-L12-v2"):
     with open(file_path, 'r', encoding='utf-8') as file:
         product_data = [json.loads(line) for line in file]
     
@@ -66,57 +66,60 @@ def load_llm_model(model_name="bigscience/bloomz-560m"):
 
 # Extraire et vérifier uniquement les informations pertinentes
 def get_flexible_answer(query, retriever, max_results=3):
-    # Récupérer les documents pertinents
     results = retriever.get_relevant_documents(query)
     
     if not results:
-        return "Je ne sais pas."  # Aucun document trouvé
+        return "Je ne sais pas.", []  # No documents found
 
-    # Filtrage des documents pour s'assurer qu'ils sont pertinents
+    # Score documents for relevance based on overlapping words
     matched_contexts = []
     query_words = set(query.lower().split())
     for result in results[:max_results]:
         document_words = set(result.page_content.lower().split())
-        if query_words & document_words:  # Vérifie s'il y a des mots en commun
-            matched_contexts.append(result.page_content)
-
+        overlap_score = len(query_words & document_words)
+        if overlap_score > 0:  # Ensure some relevance
+            matched_contexts.append((result.page_content, overlap_score))
+    
     if not matched_contexts:
-        return "Je ne sais pas."  # Aucun document ne correspond directement
+        return "Je ne sais pas.", []  # No directly relevant documents
+    
+    # Sort by relevance (overlap score) and return the most relevant
+    matched_contexts = sorted(matched_contexts, key=lambda x: x[1], reverse=True)
+    filtered_contexts = [context[0] for context in matched_contexts]
 
-    # Retourner les informations pertinentes trouvées
-    return "\n".join(matched_contexts).strip()
+    return "\n\n".join(filtered_contexts[:max_results]).strip(), filtered_contexts
 
 # Générer une réponse concise avec LLM
 def generate_response(query, context, tokenizer, model, temperature, top_p):
-    # Réduction du contexte pour éviter des prompts trop longs
-    truncated_context = context[:1000]  # Limite à 1000 caractères
+    # Truncate context to avoid token limits
+    truncated_context = context[:1000]
 
-    # Formulation d'un prompt clair et naturel
+    # Enhanced prompt with clear instructions and structured output
     prompt = f"""
-    Vous êtes un assistant qui répond aux questions sur des produits en utilisant les informations suivantes :
+    Vous êtes un assistant expert en descriptions de produits. Répondez précisément à la question suivante en utilisant les informations ci-dessous. N'utilisez aucune connaissance externe.
+
+    Contexte fourni :
     {truncated_context}
 
-    Répondez directement à la question suivante d'une manière naturelle et claire :
-    {query}
+    Instructions :
+    - Répondez de manière concise et factuelle.
+    - Si une réponse ne peut pas être trouvée dans le contexte, répondez strictement : "Je ne sais pas."
+    - Formatez la réponse de manière claire, et indiquez les informations pertinentes en citant les passages correspondants si possible.
 
-    Si aucune réponse ne peut être trouvée dans ces informations, répondez : "Je ne sais pas."
+    Question : {query}
+    Réponse :
     """
+
     inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
     outputs = model.generate(
         **inputs,
-        max_new_tokens=150,  # Limite la longueur de la réponse générée
+        max_new_tokens=150,
         temperature=temperature,
         top_p=top_p,
         num_return_sequences=1
     )
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    #response = clean_response(response, query)
-    #print(f"Réponse brute générée : {response}")
-    #print(f"Prompt utilisé : {prompt}")
-
     return response.strip()
-
 
 #def clean_response(response, query):
    # """
@@ -133,46 +136,78 @@ def generate_response(query, context, tokenizer, model, temperature, top_p):
     # Nettoyage final
    # return response.strip()
 
+def test_parameters(query, retriever, tokenizer, model, temp_values, top_p_values):
+    results = []
+    context, _ = get_flexible_answer(query, retriever)
 
-# Interface utilisateur avec Streamlit
+    for temp in temp_values:
+        for top_p in top_p_values:
+            response = generate_response(query, context, tokenizer, model, temp, top_p)
+            results.append({
+                "query": query,
+                "temperature": temp,
+                "top_p": top_p,
+                "response": response
+            })
+    return results
+
+# Streamlit main function
 def main():
     st.set_page_config(page_title="Descriptions Produits Amazon", layout="wide")
     st.title("🔍Descriptions De Produits Amazon")
-    st.write("Posez une question pour obtenir des réponses basées sur l'ensemble de documents fournies.")
+    st.write("Posez une question pour obtenir des réponses basées sur les descriptions de produits fournies.")
     
-    file_path = 'data/meta.jsonl'  # Remplacez par le chemin réel de votre fichier JSON
+    file_path = 'data/meta.jsonl'  # Path to your JSONL file
     vector_store = load_and_prepare_data(file_path)
     retriever = vector_store.as_retriever()
 
     tokenizer, model = load_llm_model()
 
-    # Barre latérale pour les paramètres
+    # Sidebar for parameters
     with st.sidebar:
         st.header("🔧 Paramètres")
         temperature = st.slider("Température (créativité)", 0.1, 2.0, 1.0, step=0.1)
         top_p = st.slider("Top-p (probabilité cumulative)", 0.1, 1.0, 0.9, step=0.1)
     
-    # Entrée utilisateur
-    query = st.text_input("💬 Posez Votre question :")
+    # User input
+    query = st.text_input("💬 Posez votre question :")
 
     if st.button("🚀 Obtenir une réponse"):
         if query.strip():
-            # Obtenir les informations pertinentes
-            context = get_flexible_answer(query, retriever)
+            # Retrieve relevant context
+            context, matched_contexts = get_flexible_answer(query, retriever)
             
             if context == "Je ne sais pas.":
                 st.write("### Réponse :")
                 st.write(context)
             else:
-                # Générer une réponse concise avec les paramètres choisis
+                # Display relevant documents
+                if matched_contexts:
+                    st.write("### Documents Pertinents :")
+                    for idx, doc in enumerate(matched_contexts):
+                        st.write(f"{idx + 1}. {doc[:300]}...")  # Display first 300 characters
+
+                # Generate a concise response
                 response = generate_response(query, context, tokenizer, model, temperature, top_p)
                 st.write("### Réponse :")
                 st.write(response)
-                # Documenter les paramètres et résultats
+                
+                # Log parameters used
                 st.write("#### Paramètres utilisés :")
                 st.write(f"Température : {temperature}, Top-p : {top_p}")
         else:
-            st.write("Posez votre réponse.")
+            st.write("Veuillez poser une question valide.")
+    
+    # Test parameters
+    if st.button("🧪 Tester les paramètres"):
+        temp_values = [0.5, 1.0, 1.5]
+        top_p_values = [0.8, 0.9, 1.0]
+        test_results = test_parameters(query, retriever, tokenizer, model, temp_values, top_p_values)
+        
+        st.write("### Résultats des tests avec différents paramètres :")
+        for result in test_results:
+            st.write(f"- **Température** : {result['temperature']}, **Top-p** : {result['top_p']}")
+            st.write(f"**Réponse** : {result['response']}")
 
 if __name__ == "__main__":
     main()
